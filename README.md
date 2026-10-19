@@ -14,3 +14,9 @@ Port Scan Module
 .\portscan.ps1 -Target 10.0.0.10-50,10.0.1.1 -Ports 1-1024
 .\portscan.ps1 -TargetFile hosts.txt -Timeout 500 -Parallel 500
 ```
+Snuffle
+```
+- .\Snuffle.ps1 → scan the current folder with the broad default ruleset
+- .\Snuffle.ps1 -Path C:\Users\Public → scan a specific root
+- .\Snuffle.ps1 -Interactive → tune extensions/keywords first, then scan
+```
