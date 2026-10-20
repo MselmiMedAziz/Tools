@@ -59,10 +59,9 @@ Snuffle
 # Interactive tuning, then search
 .\Snuffle.ps1 -Interactive
 ```
-```
-
 
 Check BitLocker
+
 ```
 (New-Object -ComObject Shell.Application).NameSpace("C:\").Self.ExtendedProperty('System.Volume.BitLockerProtection')
 ```
