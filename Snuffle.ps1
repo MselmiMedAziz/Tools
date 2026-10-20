@@ -28,6 +28,28 @@
 .PARAMETER NonInteractive
     Do not open the menu (this is the default; kept for compatibility).
 
+.PARAMETER Discover
+    Enumerate domain computers via LDAP, then enumerate and search their SMB
+    shares.  Requires domain connectivity (current user's AD context).
+
+.PARAMETER Computer
+    Enumerate and search shares on these specific hosts (names or IPs).  Skips
+    the LDAP query.
+
+.PARAMETER Share
+    Explicit share/UNC paths to search (e.g. \\server\share).  Added directly
+    without enumeration.
+
+.PARAMETER IncludeAdminShares
+    Also enumerate admin shares (C$, ADMIN$, ...).  Off by default.
+
+.PARAMETER MaxComputers
+    Cap the number of computers to enumerate when -Discover is used (0 = all).
+
+.PARAMETER Throttle
+    How many hosts to enumerate shares on in parallel (default 20).  Raise it to
+    scan a large fleet faster; lower it if hosts are flaky or the network is slow.
+
 .PARAMETER OutputFile
     Write all findings to a file.  The extension is derived from -Format.
 
@@ -78,6 +100,23 @@
 
 .EXAMPLE
     .\Snuffle.ps1 -Path \\server\share -AddExtension .bak -AddKeyword "db_pass" -OutputFile out.csv
+
+.EXAMPLE
+    .\Snuffle.ps1 -Discover -OutputFile domain_shares.csv
+    # LDAP-enumerate domain computers, enumerate their shares, search them all.
+
+.EXAMPLE
+    .\Snuffle.ps1 -Computer SRV-01,SRV-02 -MaxFindings 100
+    # Enumerate and search shares on specific hosts.
+
+.EXAMPLE
+    .\Snuffle.ps1 -Share \\files\dept,\\files\finance
+    # Search explicit shares only.
+
+.NOTES
+    List parameters (-Path, -Computer, -Share, -AddExtension, -AddKeyword,
+    -AddRule) take comma-separated values, e.g. -Computer a,b,c.  Bare
+    space-separated values are not accepted (PowerShell binds them positionally).
 #>
 
 [CmdletBinding()]
@@ -91,6 +130,20 @@ param(
     [switch]$Interactive,
 
     [switch]$NonInteractive,
+
+    [switch]$Discover,
+
+    [Alias('Computers')]
+    [string[]]$Computer,
+
+    [Alias('Shares')]
+    [string[]]$Share,
+
+    [switch]$IncludeAdminShares,
+
+    [int]$MaxComputers = 0,
+
+    [int]$Throttle = 20,
 
     [string]$OutputFile,
 
@@ -229,7 +282,7 @@ function Normalize-Extension([string]$Ext) {
 function Get-Config {
     if ($Config) {
         if (-not (Test-Path -LiteralPath $Config -PathType Leaf)) {
-            throw "Config file not found: $Config"
+            throw "Config file not found: '$Config'. If you meant to pass a list of targets, separate them with commas (e.g. -Computer a,b,c or -Share \\srv1,\\srv2) - bare space-separated values are not accepted."
         }
         $raw = Get-Content -LiteralPath $Config -Raw | ConvertFrom-Json
     }
@@ -648,6 +701,202 @@ function Search-Directory {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Network discovery: AD computers -> SMB shares (like Snaffler's finder)
+# ---------------------------------------------------------------------------
+function Get-DomainComputers {
+    # Enumerate enabled domain-joined computers via LDAP (System.DirectoryServices,
+    # built into .NET Framework).  Uses the current user's domain context.
+    try {
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher
+        $searcher.Filter = '(&(objectCategory=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
+        $searcher.PageSize = 1000
+        $searcher.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
+        [void]$searcher.PropertiesToLoad.Add('dnsHostName')
+        [void]$searcher.PropertiesToLoad.Add('name')
+        $computers = New-Object System.Collections.Generic.List[string]
+        $results = $searcher.FindAll()
+        foreach ($r in $results) {
+            $dns = $r.Properties['dnsHostName']
+            if ($dns -and $dns.Count) { $computers.Add([string]$dns[0]) }
+            else {
+                $name = $r.Properties['name']
+                if ($name -and $name.Count) { $computers.Add([string]$name[0]) }
+            }
+        }
+        $results.Dispose()
+        return @($computers | Select-Object -Unique)
+    }
+    catch {
+        Write-Warning "LDAP computer enumeration failed: $($_.Exception.Message)"
+        return @()
+    }
+}
+
+function Invoke-NetView {
+    param([string]$Computer, [int]$TimeoutMs = 8000)
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'net.exe'
+        $psi.Arguments = "view \\$Computer"
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $p = New-Object System.Diagnostics.Process
+        $p.StartInfo = $psi
+        [void]$p.Start()
+        if (-not $p.WaitForExit($TimeoutMs)) {
+            try { $p.Kill() } catch { }
+            return @()
+        }
+        return @($p.StandardOutput.ReadToEnd() -split "`r?`n")
+    }
+    catch { return @() }
+}
+
+function Get-ComputerShares {
+    param([string]$Computer, [switch]$IncludeAdminShares)
+    $Computer = $Computer.Trim().TrimEnd('\')
+    $names = New-Object System.Collections.Generic.List[string]
+
+    # net view: SMB share listing, no modules, bounded by a per-host timeout.
+    # Parsing is localization-independent: skip everything before the dashed
+    # separator line, then the share name is the column before 2+ spaces.
+    $inData = $false
+    foreach ($line in (Invoke-NetView -Computer $Computer)) {
+        $t = $line.Trim()
+        if ($t -eq '') { continue }
+        if ($t -match '^-{3,}') { $inData = $true; continue }
+        if (-not $inData) { continue }
+
+        $parts = $t -split '\s{2,}'
+        if ($parts.Count -lt 2) { continue }          # footer/blank rows lack a Type column
+        $name = $parts[0].Trim()
+        if (-not $name -or $name -match '^[^A-Za-z0-9_.\-]') { continue }
+        $names.Add($name)
+    }
+
+    $shares = New-Object System.Collections.Generic.List[string]
+    foreach ($n in ($names | Select-Object -Unique)) {
+        if ($n -eq 'IPC$') { continue }
+        if ($n.EndsWith('$') -and -not $IncludeAdminShares) { continue }
+        $shares.Add("\\$Computer\$n")
+    }
+    return @($shares)
+}
+
+function Discover-Shares {
+    param(
+        [string[]]$Computers,
+        [switch]$IncludeAdminShares,
+        [int]$MaxComputers = 0,
+        [int]$Throttle = 20
+    )
+    if (-not $Computers) { $Computers = Get-DomainComputers }
+    if (-not $Computers -or $Computers.Count -eq 0) {
+        Write-Warning 'No computers found to enumerate (check domain connectivity, or pass -Computer/-Share).'
+        return @()
+    }
+    if ($MaxComputers -gt 0 -and $Computers.Count -gt $MaxComputers) {
+        Write-Warning "Limiting enumeration to the first $MaxComputers of $($Computers.Count) computers."
+        $Computers = @($Computers | Select-Object -First $MaxComputers)
+    }
+    $Computers = @($Computers | Where-Object { $_ } | Select-Object -Unique)
+    if ($Throttle -lt 1) { $Throttle = 20 }
+
+    # Self-contained worker (runs in a separate runspace): enumerate one host's
+    # shares via net view and emit the "\\host\share" UNC paths.
+    $worker = {
+        param([string]$Computer, [bool]$IncludeAdmin)
+        $Computer = $Computer.Trim().TrimEnd('\')
+        $found = New-Object System.Collections.Generic.List[string]
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = 'net.exe'
+            $psi.Arguments = "view \\$Computer"
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $p = New-Object System.Diagnostics.Process
+            $p.StartInfo = $psi
+            [void]$p.Start()
+            if (-not $p.WaitForExit(8000)) { try { $p.Kill() } catch { } return }
+            $lines = @($p.StandardOutput.ReadToEnd() -split "`r?`n")
+        }
+        catch { return }
+
+        $inData = $false
+        foreach ($line in $lines) {
+            $t = $line.Trim()
+            if ($t -eq '') { continue }
+            if ($t -match '^-{3,}') { $inData = $true; continue }
+            if (-not $inData) { continue }
+            $parts = $t -split '\s{2,}'
+            if ($parts.Count -lt 2) { continue }
+            $name = $parts[0].Trim()
+            if (-not $name -or $name -match '^[^A-Za-z0-9_.\-]') { continue }
+            if ($name -eq 'IPC$') { continue }
+            if ($name.EndsWith('$') -and -not $IncludeAdmin) { continue }
+            $found.Add("\\$Computer\$name")
+        }
+        foreach ($s in ($found | Select-Object -Unique)) { $s }
+    }
+
+    $shares = New-Object System.Collections.Generic.List[string]
+    $total = $Computers.Count
+    $completed = 0
+
+    $pool = $null
+    try {
+        $pool = [runspacefactory]::CreateRunspacePool(1, $Throttle)
+        $pool.Open()
+    }
+    catch { $pool = $null }
+
+    if ($pool) {
+        # Parallel enumeration across hosts.
+        $jobs = New-Object System.Collections.Generic.List[object]
+        foreach ($c in $Computers) {
+            $ps = [powershell]::Create()
+            $ps.RunspacePool = $pool
+            [void]$ps.AddScript($worker).AddArgument([string]$c).AddArgument([bool]$IncludeAdminShares)
+            $jobs.Add([pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke() })
+        }
+        foreach ($j in $jobs) {
+            try {
+                $out = $j.PS.EndInvoke($j.Handle)
+                if ($out) { $out | ForEach-Object { if ($_) { $shares.Add([string]$_) } } }
+            }
+            catch { }
+            $j.PS.Dispose()
+            $completed++
+            if (-not $script:OptQuiet) {
+                Write-Progress -Activity 'Discovering network shares' -Status ("{0}/{1} hosts done" -f $completed, $total) -PercentComplete (($completed / $total) * 100)
+            }
+        }
+        $pool.Close()
+        $pool.Dispose()
+    }
+    else {
+        # Sequential fallback.
+        foreach ($c in $Computers) {
+            foreach ($s in (Get-ComputerShares -Computer $c -IncludeAdminShares:$IncludeAdminShares)) { $shares.Add($s) }
+            $completed++
+            if (-not $script:OptQuiet) {
+                Write-Progress -Activity 'Discovering network shares' -Status ("{0}/{1} hosts done" -f $completed, $total) -PercentComplete (($completed / $total) * 100)
+            }
+        }
+    }
+
+    if (-not $script:OptQuiet) {
+        Write-Progress -Activity 'Discovering network shares' -Completed
+        foreach ($s in ($shares | Select-Object -Unique)) { Write-Host ("[share] {0}" -f $s) -ForegroundColor DarkCyan }
+    }
+    return @($shares | Select-Object -Unique)
+}
+
 function Export-Findings([string]$File, [string]$Fmt) {
     if ($script:Findings.Count -eq 0) {
         if (-not $script:OptQuiet) { Write-Host 'No findings to export.' -ForegroundColor DarkGray }
@@ -806,6 +1055,19 @@ function Main {
 
     if (-not $Quiet) { Show-Banner }
 
+    # Catch the common "space-separated list" mistake: -Computer a b c (or
+    # -Share x y) leaves the extra tokens to bind positionally onto -Path.
+    # If -Path received something that is neither an existing path nor looks
+    # like a path (no '\' or ':'), tell the user to use commas.
+    if (($Computer -or $Share -or $Discover) -and $Path) {
+        foreach ($p in $Path) {
+            if (-not (Test-Path -LiteralPath $p) -and $p -notmatch '[\\:]') {
+                Write-Error "List values must be comma-separated. '$p' was read as a -Path value but is not a valid path - if you were passing a list to -Computer/-Share, use commas (e.g. -Computer a,b,c)."
+                exit 1
+            }
+        }
+    }
+
     try { $cfg = Get-Config } catch { Write-Error $_; exit 1 }
 
     if ($ListDefaults) {
@@ -832,11 +1094,33 @@ function Main {
     # Resolve output file
     $outFile = $OutputFile
 
-    if (-not $cfg.SearchPaths -or $cfg.SearchPaths.Count -eq 0) {
+    # Assemble the list of paths to search: explicit paths + explicit shares +
+    # per-computer share enumeration + optional full-domain discovery.
+    $explicitDiscovery = [bool]($Share -or $Computer -or $Discover)
+    $hadConfiguredPaths = [bool]($cfg.SearchPaths -and $cfg.SearchPaths.Count -gt 0)
+
+    $searchPaths = New-Object System.Collections.Generic.List[string]
+    foreach ($p in @($cfg.SearchPaths)) { if ($p) { $searchPaths.Add($p) } }
+    foreach ($s in @($Share)) { if ($s) { $searchPaths.Add($s.Trim().TrimEnd('\')) } }
+
+    if ($Computer) {
+        foreach ($s in (Discover-Shares -Computers $Computer -IncludeAdminShares:$IncludeAdminShares -Throttle $Throttle)) { $searchPaths.Add($s) }
+    }
+    if ($Discover) {
+        foreach ($s in (Discover-Shares -IncludeAdminShares:$IncludeAdminShares -MaxComputers $MaxComputers -Throttle $Throttle)) { $searchPaths.Add($s) }
+    }
+
+    if ($searchPaths.Count -eq 0) {
+        if ($explicitDiscovery -or $hadConfiguredPaths) {
+            Write-Warning 'No shares or paths were resolved to search. Check connectivity, credentials, or the given targets.'
+            return
+        }
         $cwd = (Get-Location).Path
-        $cfg.SearchPaths = @($cwd)
+        $searchPaths.Add($cwd)
         if (-not $Quiet) { Write-Host "No search path given; scanning current directory: $cwd" -ForegroundColor DarkYellow }
     }
+
+    $cfg.SearchPaths = @($searchPaths | Where-Object { $_ } | Select-Object -Unique)
 
     # Build compiled regexes once
     $script:Rules = @()
