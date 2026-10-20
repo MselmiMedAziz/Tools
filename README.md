@@ -65,3 +65,23 @@ Check BitLocker
 ```
 (New-Object -ComObject Shell.Application).NameSpace("C:\").Self.ExtendedProperty('System.Volume.BitLockerProtection')
 ```
+
+
+
+
+
+How to run Get-LocalAdminPaths.ps1
+```
+# On a Windows PE / live Windows that can see the target's disk (physical path):
+.\Get-LocalAdminPaths.ps1 -Mode Physical
+
+# On the target itself with any foothold shell (local priv-esc path):
+.\Get-LocalAdminPaths.ps1 -Mode Local
+
+# From your attacker box, against the domain (highest ROI, no physical needed):
+.\Get-LocalAdminPaths.ps1 -Mode AD -Domain corp.local -Target FS01
+.\Get-LocalAdminPaths.ps1 -Mode AD -Domain corp.local -Credential (Get-Credential)   # explicit creds
+
+# Everything at once:
+.\Get-LocalAdminPaths.ps1 -Mode All -Domain corp.local
+```
