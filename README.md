@@ -19,4 +19,50 @@ Snuffle
 - .\Snuffle.ps1 → scan the current folder with the broad default ruleset
 - .\Snuffle.ps1 -Path C:\Users\Public → scan a specific root
 - .\Snuffle.ps1 -Interactive → tune extensions/keywords first, then scan
+
+##  Quick start
+
+```powershell
+# Search the current folder with the broad default ruleset
+.\Snuffle.ps1
+
+# Search a specific root (local or UNC)
+.\Snuffle.ps1 -Path C:\Users\Public
+.\Snuffle.ps1 -Path \\fileserver\dept
+
+# Discover every domain computer's shares and search them all
+.\Snuffle.ps1 -Discover -OutputFile fleet_findings.csv
+
+# Tune extensions/keywords interactively before searching
+.\Snuffle.ps1 -Interactive
+```
+
+---
+## Examples
+
+```powershell
+# Default: scan the current directory
+.\Snuffle.ps1
+
+# A whole user-profile tree, quiet, capped
+.\Snuffle.ps1 -Path C:\Users\Public -MaxFindings 500 -Quiet
+
+# Wider net: every text file + report extensions even without content hits
+.\Snuffle.ps1 -Path C:\x -ScanAllTextFiles -ReportExtensionHits
+
+# Search explicit shares and save both formats
+.\Snuffle.ps1 -Share \\files\dept,\\files\finance -OutputFile out -Format both
+
+# Domain sweep with admin shares included
+.\Snuffle.ps1 -Discover -IncludeAdminShares -Throttle 40 -OutputFile all.csv
+
+# Interactive tuning, then search
+.\Snuffle.ps1 -Interactive
+```
+```
+
+
+Check BitLocker
+```
+(New-Object -ComObject Shell.Application).NameSpace("C:\").Self.ExtendedProperty('System.Volume.BitLockerProtection')
 ```
