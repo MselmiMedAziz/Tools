@@ -88,3 +88,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "$w=New-Object ('Net'+'.'
 # Everything at once:
 .\Get-LocalAdminPaths.ps1 -Mode All -Domain corp.local
 ```
+
+
+Get-UsersAndGroups.ps1
+```
+.\Get-UsersAndGroups.ps1 | Format-Table -AutoSize
+.\Get-UsersAndGroups.ps1 -CsvPath .\users.csv
+.\Get-UsersAndGroups.ps1 -SearchRoot "LDAP://OU=Staff,DC=contoso,DC=com"
+```
