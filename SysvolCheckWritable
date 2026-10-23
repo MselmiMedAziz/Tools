@@ -50,3 +50,24 @@ Timing/notes:
 - If you don't have write but you're in Group Policy Creator Owners (or can get a member), that's a separate path — you can create a new GPO and link it.
 
 Want me to add a -CheckWrite switch to ad-healthcheck.ps1 that does this writable-SYSVOL scan automatically (and lists which GPOs/scripts are writable)? That'd fold this check into your existing no-admin run.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+$pol = "\\domain.local\SYSVOL\domain.local\Policies"
+Get-ChildItem $pol -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    Get-ChildItem $_.FullName -Recurse -Directory -ErrorAction SilentlyContinue
+} | ForEach-Object { if (Test-Write $_.FullName) { "WRITABLE DIR: $($_.FullName)" } }
