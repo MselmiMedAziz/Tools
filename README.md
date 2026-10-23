@@ -96,3 +96,22 @@ Get-UsersAndGroups.ps1
 .\Get-UsersAndGroups.ps1 -CsvPath .\users.csv
 .\Get-UsersAndGroups.ps1 -SearchRoot "LDAP://OU=Staff,DC=contoso,DC=com"
 ```
+
+
+SYSVOL
+
+$f = Get-Content .\*_sysvol_findings.json -Raw | ConvertFrom-Json
+
+# full paths
+$f | ForEach-Object { $_.File }
+
+# dump every script's contents
+$f | Where-Object Type -eq 'Script' | ForEach-Object {
+    "`n===== $($_.File) ====="
+    Get-Content $_.File -ErrorAction SilentlyContinue
+}
+
+# grep for credentials
+$f | ForEach-Object {
+    Select-String -Path $_.File -Pattern 'password','passwd','pwd','net use','/user:','secret','token','key=' -ErrorAction SilentlyContinue
+}
