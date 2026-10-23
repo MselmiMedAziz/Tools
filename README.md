@@ -99,7 +99,7 @@ Get-UsersAndGroups.ps1
 
 
 SYSVOL
-
+```
 $f = Get-Content .\*_sysvol_findings.json -Raw | ConvertFrom-Json
 
 # full paths
@@ -115,3 +115,6 @@ $f | Where-Object Type -eq 'Script' | ForEach-Object {
 $f | ForEach-Object {
     Select-String -Path $_.File -Pattern 'password','passwd','pwd','net use','/user:','secret','token','key=' -ErrorAction SilentlyContinue
 }
+
+
+```
