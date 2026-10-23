@@ -1,13 +1,4 @@
 # ============================================================================
-#  win-privesc-check.ps1
-#  Lightweight Windows privilege-escalation enumeration — native only.
-#  Read-only. No third-party modules. Locale-independent (uses SIDs, not names).
-#
-#  Usage (as the unprivileged user you are testing):
-#     powershell -ExecutionPolicy Bypass -File .\win-privesc-check.ps1
-#     .\win-privesc-check.ps1 | Tee-Object -FilePath results.txt
-#
-#  Legend:  [+] good/notable   [i] info   [!] likely escalation lead
 # ============================================================================
 $ErrorActionPreference = 'SilentlyContinue'
 
@@ -124,11 +115,11 @@ Info ("LocalAccountTokenFilterPolicy= " + (RegVal 'HKLM:\SOFTWARE\Microsoft\Wind
 if ((RegVal 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'EnableLUA') -eq 0) { Bad "UAC disabled (EnableLUA=0)" }
 
 # ============================================================================
-Banner "7. SERVICES — UNQUOTED PATH / WRITABLE BINARY"
+Banner "7. SERVICES - UNQUOTED PATH / WRITABLE BINARY"
 foreach ($s in Get-CimInstance Win32_Service) {
     $p = ($s.PathName -replace '^\s+','').Trim()
     if (-not $p -or $p -notmatch '\.exe') { continue }
-    $isSystem = ($s.StartName -eq 'LocalSystem' -or $s.StartName -match 'SYSTEM' -or $s.StartName -match 'Autorité')
+    $isSystem = ($s.StartName -eq 'LocalSystem' -or $s.StartName -match 'SYSTEM')
     if (($p -match ' ') -and ($p -notmatch '^"') -and ($p -notmatch '(?i)\\system32\\|\\syswow64\\')) {
         Bad ("Unquoted path: $($s.Name) -> $p   (runs as $($s.StartName))")
     }
@@ -140,7 +131,7 @@ foreach ($s in Get-CimInstance Win32_Service) {
 }
 
 # ============================================================================
-Banner "8. SCHEDULED TASKS — SYSTEM + WRITABLE ACTION"
+Banner "8. SCHEDULED TASKS - SYSTEM + WRITABLE ACTION"
 Get-ScheduledTask -ErrorAction SilentlyContinue | ForEach-Object {
     $t = $_
     if ($t.Principal.UserId -match 'SYSTEM|Autorit') {
@@ -225,7 +216,7 @@ if (Test-Path "$env:APPDATA\Microsoft\Credentials") { Get-ChildItem "$env:APPDAT
 
 # ============================================================================
 Banner "17. NAMED PIPES"
-try { Get-ChildItem '\\.\pipe\' -ErrorAction SilentlyContinue | ForEach-Object { Info $_.Name } } catch {}
+try { [System.IO.Directory]::GetFiles('\\.\pipe\') | ForEach-Object { Info $_ } } catch {}
 
 # ============================================================================
 Banner "18. AV / EDR / APPLOCKER / WDAC"
@@ -236,7 +227,7 @@ Info ("AppLocker (SrpV2)     : " + [bool](Test-Path 'HKLM:\SOFTWARE\Policies\Mic
 Info ("WDAC (CodeIntegrity)  : " + [bool](Test-Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CodeIntegrity'))
 
 # ============================================================================
-Banner "19. OS BUILD — manual kernel-exploit cross-check"
+Banner "19. OS BUILD - manual kernel-exploit cross-check"
 $b = [int]$os.BuildNumber
 Info "Build $b  (verify against a current CVE list; hints below are illustrative)"
 if ($b -lt 9600)  { Info "  <= 8.1 / 2012 R2 era -> many legacy EoPs may apply" }
