@@ -118,3 +118,18 @@ $f | ForEach-Object {
 
 
 ```
+
+
+
+checkl
+
+
+```
+Run it
+
+powershell -ExecutionPolicy Bypass -File D:\TEMP\IIG\win-privesc-check.ps1
+# capture to a file:
+powershell -ExecutionPolicy Bypass -File D:\TEMP\IIG\win-privesc-check.ps1 | Tee-Object -FilePath D:\TEMP\IIG\privesc-results.txt
+
+
+```
