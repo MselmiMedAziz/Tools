@@ -1,5 +1,3 @@
-# ============================================================================
-# ============================================================================
 $ErrorActionPreference = 'SilentlyContinue'
 
 function Banner($t) { Write-Output ("`n" + ('=' * 72) + "`n  " + $t + "`n" + ('=' * 72)) }
@@ -15,16 +13,13 @@ function Test-Writable($path) {
         $me   = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         $want = [System.Security.Principal.WindowsIdentity]::GetCurrent().Groups | ForEach-Object { $_.Value }
         $everyoneSids = @($me, 'S-1-1-0', 'S-1-5-32-545', 'S-1-5-11') + $want
-        $w = [System.Security.AccessControl.FileSystemRights]::Write
-        $m = [System.Security.AccessControl.FileSystemRights]::Modify
-        $f = [System.Security.AccessControl.FileSystemRights]::FullControl
-        $need = $w -bor $m -bor $f
+        $writeBits = [System.Security.AccessControl.FileSystemRights]::WriteData -bor [System.Security.AccessControl.FileSystemRights]::AppendData
         foreach ($acc in $acl.Access) {
             if ($acc.AccessControlType -ne 'Allow') { continue }
             $sid = $null
             try { $sid = $acc.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
             catch { $sid = $acc.IdentityReference.Value }
-            if ($everyoneSids -contains $sid -and (($acc.FileSystemRights -band $need) -ne 0)) { return $true }
+            if ($everyoneSids -contains $sid -and (($acc.FileSystemRights -band $writeBits) -ne 0)) { return $true }
         }
         return $false
     } catch { return $false }
@@ -234,5 +229,85 @@ if ($b -lt 9600)  { Info "  <= 8.1 / 2012 R2 era -> many legacy EoPs may apply" 
 elseif ($b -ge 10240 -and $b -le 17763) { Info "  1507..1809 -> PrintNightmare / HiveNightmare era" }
 elseif ($b -ge 18362 -and $b -le 19043) { Info "  1903..21H1 -> HiveNightmare (SAM readable), PrintNightmare" }
 else { Info "  modern build -> cross-check current CVEs manually" }
+
+# ============================================================================
+Banner "20. DLL-HIJACK / WRITABLE THIRD-PARTY APP DIRS"
+$appRoots = @(
+  'C:\Program Files\TeamViewer','C:\Program Files (x86)\TeamViewer',
+  'C:\Program Files\Dell','C:\Program Files (x86)\Dell',
+  'C:\Program Files\SafeNet','C:\Program Files (x86)\SafeNet',
+  'C:\Program Files\Gemalto','C:\Program Files (x86)\Gemalto',
+  'C:\Program Files\GoSign','C:\Program Files (x86)\GoSign',
+  'C:\Program Files\Swift','C:\Program Files (x86)\Swift',
+  'C:\Program Files\SentinelOne','C:\Program Files (x86)\SentinelOne',
+  'C:\Program Files\Intel','C:\Program Files (x86)\Intel',
+  'C:\Program Files\Google','C:\Program Files (x86)\Google',
+  'C:\Program Files\Mozilla Firefox','C:\Program Files (x86)\Mozilla Firefox',
+  'C:\Program Files\Microsoft Office','C:\Program Files (x86)\Microsoft Office'
+)
+$binExt = '.exe','.dll','.sys','.bat','.ps1','.vbs','.com'
+foreach ($root in $appRoots) {
+  if (-not (Test-Path $root)) { continue }
+  $candidates = @($root)
+  $candidates += Get-ChildItem $root -Recurse -Depth 2 -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+  foreach ($d in $candidates) {
+    if (-not (Test-Writable $d)) { continue }
+    $bins = Get-ChildItem $d -File -ErrorAction SilentlyContinue | Where-Object { $binExt -contains $_.Extension }
+    if ($bins) { Bad ("Writable dir w/ binaries: $d  ($(($bins | Measure-Object).Count) files)") }
+  }
+}
+
+# ============================================================================
+Banner "21. SERVICE BINARY FILE OVERWRITABLE (SYSTEM)"
+foreach ($s in Get-CimInstance Win32_Service) {
+  $p = ($s.PathName -replace '^\s+','').Trim()
+  if (-not $p -or $p -notmatch '\.exe') { continue }
+  if (-not ($s.StartName -eq 'LocalSystem' -or $s.StartName -match 'SYSTEM')) { continue }
+  $exe = ($p -replace '^"?([^"]+?\.exe).*$','$1')
+  if (Test-Path $exe) {
+    if (Test-Writable $exe) { Bad ("Service EXE overwritable: $($s.Name) -> $exe") }
+  } else {
+    $d2 = Split-Path $exe -Parent
+    if ($d2 -and (Test-Writable $d2)) { Bad ("Service EXE missing + dir writable: $($s.Name) -> $exe") }
+  }
+}
+
+# ============================================================================
+Banner "22. NODE.JS / PM2"
+Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '^(node|pm2|npm)' } | ForEach-Object {
+  Info ("Process {0}  PID {1}  {2}" -f $_.ProcessName, $_.Id, $_.Path)
+}
+foreach ($p in @("$env:USERPROFILE\.pm2", "$env:APPDATA\npm", "$env:APPDATA\npm-cache")) {
+  if (Test-Path $p) { Info ("Node config: $p  (writable=" + (Test-Writable $p) + ")") }
+}
+
+# ============================================================================
+Banner "23. NAMED PIPE PERMISSIONS (non-default pipes)"
+$noise = 'mojo','PSHost','Winsock2','Sessions','AppContainer','dotnet-diagnostic','crashpad','CatalogChangeListener','LOCAL','OfficeUser'
+try {
+  $pipes = [System.IO.Directory]::GetFiles('\\.\pipe\')
+  foreach ($p in $pipes) {
+    $name = Split-Path $p -Leaf
+    $skip = $false
+    foreach ($n in $noise) { if ($name -match $n) { $skip = $true; break } }
+    if ($skip) { continue }
+    $acl = Get-Acl $p -ErrorAction SilentlyContinue
+    if (-not $acl) { continue }
+    $writable = $false
+    foreach ($acc in $acl.Access) {
+      $r = $acc.PipeAccessRights
+      if ($r -and ("$r" -match 'Write|FullControl|ChangePermissions')) { $writable = $true }
+    }
+    if ($writable) { Bad ("Pipe (writable ACE): $name   owner=$($acl.Owner)") }
+    else { Info ("Pipe: $name   owner=$($acl.Owner)") }
+  }
+} catch {}
+
+# ============================================================================
+Banner "24. WSL / DOCKER / VIRTUALIZATION"
+Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '(?i)docker|wsl|vmware|vbox|vmmem|vmms' } | ForEach-Object {
+  Info ("Hypervisor/container process: " + $_.ProcessName + "  (PID " + $_.Id + ")")
+}
+if (Test-Path "$env:LOCALAPPDATA\Packages\CanonicalGroupLimited*") { Info "WSL Ubuntu distro present" }
 
 Write-Output "`n[+] Enumeration complete. Review [!] items."
