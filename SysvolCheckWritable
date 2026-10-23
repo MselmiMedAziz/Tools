@@ -60,14 +60,14 @@ Want me to add a -CheckWrite switch to ad-healthcheck.ps1 that does this writabl
 
 
 
-
-
-
-
-
-
-
-$pol = "\\domain.local\SYSVOL\domain.local\Policies"
-Get-ChildItem $pol -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-    Get-ChildItem $_.FullName -Recurse -Directory -ErrorAction SilentlyContinue
-} | ForEach-Object { if (Test-Write $_.FullName) { "WRITABLE DIR: $($_.FullName)" } }
+$f = Get-Content .\*_sysvol_findings.json -Raw | ConvertFrom-Json
+$f | Where-Object Type -eq 'Script' | ForEach-Object {
+    $dir  = Split-Path $_.File
+    $test = Join-Path $dir ("zz_probe_" + [guid]::NewGuid().ToString('N') + ".txt")
+    try {
+        'probe' | Set-Content -Path $test -ErrorAction Stop
+        if (Test-Path $test) { "WRITE OK  : $dir"; Remove-Item $test -ErrorAction SilentlyContinue }
+    } catch {
+        "NO WRITE  : $dir"
+    }
+}
