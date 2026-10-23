@@ -7,13 +7,14 @@
     Emits node/relationship JSON (users, computers, groups, domains, OUs,
     containers, GPOs, membership, links, trusts, and object access-control
     entries) and packages it into a single archive for import into a graph
-    analysis tool.
+    analysis tool. Runs as a normal domain user - no local admin required.
 
     Switches to lower the footprint:
       -NoACL      skip access-control (DACL) collection entirely - much faster
                   and far quieter, at the cost of the permission edges.
       -DelayMs    throttle between collection passes (spreads out the volume).
       -Quiet      minimal console output.
+      -Test       bind, verify read access, and exit (quick sanity check).
 
 .PARAMETER Domain
     DNS domain name. Defaults to the current machine's domain.
@@ -41,7 +42,8 @@ param(
     [string]$OutputDir = '.',
     [switch]$NoACL,
     [int]$DelayMs = 0,
-    [switch]$Quiet
+    [switch]$Quiet,
+    [switch]$Test
 )
 
 $ErrorActionPreference = 'Stop'
@@ -252,6 +254,25 @@ $domainUp  = $Domain.ToUpper()
 if (-not $Quiet) { Write-Host "[*] Target: $Domain  (SID $domainSid)" -ForegroundColor Cyan }
 
 if ($domainSid) { $script:SidType[$domainSid] = 'Domain' }
+
+# Quick validation mode
+if ($Test) {
+    Write-Host "[*] Bind OK: $Domain  (SID $domainSid)" -ForegroundColor Green
+    $checks = [ordered]@{
+        'users'     = '(&(objectClass=user)(objectCategory=person))'
+        'computers' = '(objectClass=computer)'
+        'groups'    = '(objectClass=group)'
+        'ous'       = '(objectClass=organizationalUnit)'
+        'gpos'      = '(objectClass=groupPolicyContainer)'
+    }
+    foreach ($k in $checks.Keys) {
+        $s = New-Searcher -Filter $checks[$k] -Props @('objectSid') -SearchBase $defaultNC
+        $s.SizeLimit = 1
+        $r = $s.FindOne()
+        Write-Host ("    {0,-10} {1}" -f $k, $(if ($r) {'readable'} else {'no access / empty'}))
+    }
+    return
+}
 
 # ---------------------------------------------------------------------------
 # Domain node
