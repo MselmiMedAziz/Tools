@@ -132,6 +132,19 @@ function To-Unix {
     } catch { return 0 }
 }
 
+function Get-Sid {
+    param($Bytes)
+    if ($null -eq $Bytes) { return $null }
+    try { return (New-Object System.Security.Principal.SecurityIdentifier([byte[]]$Bytes, 0)).Value }
+    catch { return $null }
+}
+
+function Get-Guid {
+    param($Bytes)
+    if ($null -eq $Bytes) { return $null }
+    try { return (New-Object Guid (,$Bytes)).ToString() } catch { return $null }
+}
+
 function Get-PrincipalType {
     param([string]$Sid)
     if ($script:SidType.ContainsKey($Sid)) { return $script:SidType[$Sid] }
@@ -222,13 +235,23 @@ if ($Credential) {
 } else {
     $rootDse = New-Object System.DirectoryServices.DirectoryEntry("$bindPath/rootDSE")
 }
-$defaultNC = $rootDse.Properties['defaultNamingContext'][0].ToString()
-$domainSid = (New-Object System.Security.Principal.SecurityIdentifier($rootDse.Properties['objectSid'][0], 0)).Value
+$defaultNC = $null
+if ($rootDse.Properties.Contains('defaultNamingContext')) {
+    $defaultNC = $rootDse.Properties['defaultNamingContext'][0].ToString()
+}
+if (-not $defaultNC) {
+    throw "Cannot read the directory naming context - check -Domain/-Server and supply -Credential (domain account)."
+}
+
+$domainSid = $null
+if ($rootDse.Properties.Contains('objectSid')) {
+    $domainSid = Get-Sid $rootDse.Properties['objectSid'][0]
+}
 $domainUp  = $Domain.ToUpper()
 
 if (-not $Quiet) { Write-Host "[*] Target: $Domain  (SID $domainSid)" -ForegroundColor Cyan }
 
-$script:SidType[$domainSid] = 'Domain'
+if ($domainSid) { $script:SidType[$domainSid] = 'Domain' }
 
 # ---------------------------------------------------------------------------
 # Domain node
@@ -240,6 +263,8 @@ $domLinks = @()
 $domProps = @{}
 if ($domRes.Count -gt 0) {
     $d = $domRes[0]
+    if (-not $domainSid) { $domainSid = Get-Sid (Get-Prop $d 'objectSid') }
+    if (-not $domainSid) { throw "Could not determine the domain SID. Supply -Credential (domain account)." }
     $fn = Get-Prop $d 'msDS-Behavior-Version' '0'
     $fl = switch ([int]$fn) {
         0 {'2000'} 1 {'2003'} 2 {'2003'} 3 {'2008'} 4 {'2008 R2'} 5 {'2012'} 6 {'2012 R2'} 7 {'2016'} 8 {'2019'} default {'2019+'}
@@ -276,7 +301,8 @@ $uProps = @('name','sAMAccountName','distinguishedName','objectSid','userAccount
 if (-not $NoACL) { $uProps += 'ntSecurityDescriptor' }
 $uSearcher = New-Searcher -Filter "(&(objectClass=user)(objectCategory=person))" -Props $uProps -SearchBase $defaultNC
 foreach ($r in Get-AllResults $uSearcher) {
-    $sid = (New-Object System.Security.Principal.SecurityIdentifier((Get-Prop $r 'objectSid'), 0)).Value
+    $sid = Get-Sid (Get-Prop $r 'objectSid')
+    if (-not $sid) { continue }
     $sam = (Get-Prop $r 'sAMAccountName' '')
     $dn  = (Get-Prop $r 'distinguishedName' '')
     $script:SidType[$sid] = 'User'
@@ -290,7 +316,7 @@ foreach ($r in Get-AllResults $uSearcher) {
     $unconstr   = ($uac -band 0x80000) -ne 0
 
     $spns = @(Get-Props $r 'servicePrincipalName')
-    $sidHist = @(Get-Props $r 'sIDHistory') | ForEach-Object { (New-Object System.Security.Principal.SecurityIdentifier($_,0)).Value }
+    $sidHist = @(Get-Props $r 'sIDHistory') | ForEach-Object { Get-Sid $_ } | Where-Object { $_ }
 
     $allowedToDelegate = @(Get-Props $r 'msDS-AllowedToDelegateTo')
 
@@ -339,7 +365,8 @@ $cProps = @('name','sAMAccountName','distinguishedName','objectSid','userAccount
 if (-not $NoACL) { $cProps += 'ntSecurityDescriptor' }
 $cSearcher = New-Searcher -Filter "(objectClass=computer)" -Props $cProps -SearchBase $defaultNC
 foreach ($r in Get-AllResults $cSearcher) {
-    $sid = (New-Object System.Security.Principal.SecurityIdentifier((Get-Prop $r 'objectSid'), 0)).Value
+    $sid = Get-Sid (Get-Prop $r 'objectSid')
+    if (-not $sid) { continue }
     $sam = (Get-Prop $r 'sAMAccountName' '')
     $dn  = (Get-Prop $r 'distinguishedName' '')
     $script:SidType[$sid] = 'Computer'
@@ -402,7 +429,8 @@ $gProps = @('name','sAMAccountName','distinguishedName','objectSid','description
 if (-not $NoACL) { $gProps += 'ntSecurityDescriptor' }
 $gSearcher = New-Searcher -Filter "(objectClass=group)" -Props $gProps -SearchBase $defaultNC
 foreach ($r in Get-AllResults $gSearcher) {
-    $sid = (New-Object System.Security.Principal.SecurityIdentifier((Get-Prop $r 'objectSid'), 0)).Value
+    $sid = Get-Sid (Get-Prop $r 'objectSid')
+    if (-not $sid) { continue }
     $sam = (Get-Prop $r 'sAMAccountName' '')
     $dn  = (Get-Prop $r 'distinguishedName' '')
     $script:SidType[$sid] = 'Group'
@@ -454,7 +482,8 @@ $ouNodes = @(); $containerNodes = @(); $gpoNodes = @()
 
 $ouSearcher = New-Searcher -Filter "(objectClass=organizationalUnit)" -Props @('name','distinguishedName','objectGUID','description','gPLink','objectSid') -SearchBase $defaultNC
 foreach ($r in Get-AllResults $ouSearcher) {
-    $guid = (New-Object Guid (,$r.Properties['objectGUID'][0])).ToString()
+    $guid = Get-Guid $r.Properties['objectGUID'][0]
+    if (-not $guid) { continue }
     $dn   = (Get-Prop $r 'distinguishedName' '')
     $name = (Get-Prop $r 'name' '')
     $script:DNToSid[$dn]  = $guid
@@ -475,7 +504,8 @@ Wait-Throttle $DelayMs
 
 $conSearcher = New-Searcher -Filter "(&(objectClass=container)(!(objectClass=organizationalUnit)))" -Props @('name','distinguishedName','objectGUID','description') -SearchBase $defaultNC
 foreach ($r in Get-AllResults $conSearcher) {
-    $guid = (New-Object Guid (,$r.Properties['objectGUID'][0])).ToString()
+    $guid = Get-Guid $r.Properties['objectGUID'][0]
+    if (-not $guid) { continue }
     $dn   = (Get-Prop $r 'distinguishedName' '')
     $name = (Get-Prop $r 'name' '')
     $script:DNToSid[$dn]  = $guid
@@ -494,7 +524,8 @@ Wait-Throttle $DelayMs
 
 $gpoSearcher = New-Searcher -Filter "(objectClass=groupPolicyContainer)" -Props @('name','distinguishedName','objectGUID','description','gPCFileSysPath') -SearchBase $defaultNC
 foreach ($r in Get-AllResults $gpoSearcher) {
-    $guid = (New-Object Guid (,$r.Properties['objectGUID'][0])).ToString()
+    $guid = Get-Guid $r.Properties['objectGUID'][0]
+    if (-not $guid) { continue }
     $dn   = (Get-Prop $r 'distinguishedName' '')
     $name = (Get-Prop $r 'name' '')
     $node = [ordered]@{
@@ -517,7 +548,7 @@ $tSearcher = New-Searcher -Filter "(objectClass=trustedDomain)" -Props @('trustP
 foreach ($r in Get-AllResults $tSearcher) {
     $partnerSid = $null
     if ($r.Properties.Contains('securityIdentifier')) {
-        $partnerSid = (New-Object System.Security.Principal.SecurityIdentifier($r.Properties['securityIdentifier'][0],0)).Value
+        $partnerSid = Get-Sid $r.Properties['securityIdentifier'][0]
     }
     if (-not $partnerSid) { continue }
     $trustEdges += [ordered]@{
